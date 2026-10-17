@@ -1,0 +1,24 @@
+[package]
+name = "quotatop"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Terminal dashboard for Claude, Codex and Antigravity usage limits, sessions and prompt cache"
+
+[dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+iana-time-zone = "0.1.65"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+serde_json = "1.0.154"
+
+[target."cfg(unix)".dependencies]
+libc = "0.2.191"
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
