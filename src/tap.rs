@@ -33,22 +33,32 @@ pub fn run(args: &[String]) -> i32 {
 
 fn save(v: &Value, raw: &[u8]) -> std::io::Result<()> {
     let Some(sid) = v.get("session_id").and_then(Value::as_str) else { return Ok(()) };
-    if sid.is_empty() || !sid.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+    if !util::safe_id(sid) {
         return Ok(());
     }
+    // Claude Code keeps the same data at 0700/0600, so the spool matches that.
     let dir = util::spool_dir();
-    std::fs::create_dir_all(&dir)?;
+    util::private_dir(&dir).map_err(std::io::Error::other)?;
     let path = dir.join(format!("{sid}.json"));
     // With refreshInterval set, Claude Code re-sends the same JSON every few seconds.
     // Only the file time needs to change then.
-    if std::fs::read(&path).is_ok_and(|old| old == raw) {
+    if util::read_limited(&path, 1 << 20).is_ok_and(|old| old == raw) {
         return std::fs::File::options()
             .write(true)
             .open(&path)?
             .set_modified(std::time::SystemTime::now());
     }
     let tmp = dir.join(format!(".{sid}.{}.tmp", std::process::id()));
-    std::fs::write(&tmp, raw)?;
+    let _ = std::fs::remove_file(&tmp);
+    // create_new refuses an existing file or symlink at the temp name.
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600);
+    }
+    o.open(&tmp)?.write_all(raw)?;
     std::fs::rename(&tmp, &path)
 }
 
@@ -69,11 +79,19 @@ fn chain(cmd: &str, input: &[u8]) -> i32 {
     child.wait().ok().and_then(|s| s.code()).unwrap_or(1)
 }
 
+/// The model name with control and bidirectional-override characters removed, so text in
+/// the JSON cannot send escape sequences to the terminal.
+fn printable(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control() && !matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'))
+        .collect()
+}
+
 fn default_line(v: &Value) -> String {
-    let model = v.pointer("/model/display_name").and_then(Value::as_str).unwrap_or("Claude");
+    let model = printable(v.pointer("/model/display_name").and_then(Value::as_str).unwrap_or("Claude"));
     match v.pointer("/context_window/used_percentage").and_then(Value::as_f64) {
         Some(p) => format!("{model} · context {}", util::pct(p)),
-        None => model.to_string(),
+        None => model,
     }
 }
 
@@ -85,5 +103,17 @@ pub fn clean_spool() {
         if util::mtime(&e.path()).is_some_and(|m| m < cutoff) {
             let _ = std::fs::remove_file(e.path());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_line_drops_escapes() {
+        let v = serde_json::json!({"model": {"display_name": "Opus\u{1b}]52;c;aGk=\u{7}\u{202e} 5.5"},
+            "context_window": {"used_percentage": 12.0}});
+        assert_eq!(default_line(&v), "Opus]52;c;aGk= 5.5 · context 12%");
     }
 }

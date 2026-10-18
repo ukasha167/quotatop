@@ -19,9 +19,11 @@ const WEEK: i64 = 7 * 86_400;
 // ------------------------------------------------------------ Claude
 
 /// `claude -p /usage`: about 4 s. It prints text, so the numbers match what /usage shows.
+/// `-p` skips the workspace trust prompt, so only user settings and no MCP servers are loaded.
 pub fn fetch_claude(bin: &Path) -> Result<Limits, String> {
-    let mut cmd = command(bin);
+    let mut cmd = command(bin)?;
     cmd.args(["-p", "/usage", "--output-format", "json", "--no-session-persistence"]);
+    cmd.args(["--setting-sources", "user", "--strict-mcp-config"]);
     let out = run_capture(cmd, Duration::from_secs(60))?;
     let v: Value = serde_json::from_str(out.trim()).map_err(|_| "unexpected output from claude".to_string())?;
     let text = v.get("result").and_then(Value::as_str).unwrap_or("");
@@ -39,13 +41,13 @@ pub fn parse_claude_usage(text: &str, now: i64, local_tz: Option<&str>) -> Resul
         let Some(rest) = line.trim().strip_prefix("Current ") else { continue };
         let Some((label, rest)) = rest.split_once(": ") else { continue };
         let Some((num, rest)) = rest.split_once("% used") else { continue };
-        let Ok(used) = num.trim().parse::<f64>() else { continue };
-        let (label, length) = match label {
-            "session" => ("5-hour".to_string(), Some(FIVE_HOURS)),
-            "week (all models)" => ("Weekly".to_string(), Some(WEEK)),
+        let Some(used) = num.trim().parse::<f64>().ok().filter(|u| u.is_finite()) else { continue };
+        let (label, length, per_model) = match label {
+            "session" => ("5-hour".to_string(), Some(FIVE_HOURS), false),
+            "week (all models)" => ("Weekly".to_string(), Some(WEEK), false),
             other => match other.strip_prefix("week (").and_then(|s| s.strip_suffix(')')) {
-                Some(model) => (format!("Weekly {model}"), Some(WEEK)),
-                None => (other.to_string(), None),
+                Some(model) => (format!("Weekly {model}"), Some(WEEK), true),
+                None => (other.to_string(), None, false),
             },
         };
         let reset_text = rest.split_once("resets ").map(|x| x.1.trim());
@@ -63,6 +65,7 @@ pub fn parse_claude_usage(text: &str, now: i64, local_tz: Option<&str>) -> Resul
             length,
             // Claude leaves out "resets" for a window that has not begun.
             not_started: used == 0.0 && reset_text.is_none(),
+            per_model,
         });
     }
     if windows.is_empty() {
@@ -84,7 +87,7 @@ fn parse_claude_reset(text: &str, now: i64, local_tz: Option<&str>) -> Result<Op
         _ => (text, None),
     };
     if let (Some(tz), Some(local)) = (tz, local_tz) {
-        if tz != local {
+        if !same_zone(tz, local) {
             return Err(format!("Claude gives reset times in {tz}, this machine uses {local}"));
         }
     }
@@ -92,7 +95,9 @@ fn parse_claude_reset(text: &str, now: i64, local_tz: Option<&str>) -> Result<Op
         Some((d, t)) => (Some(d.trim()), t.trim()),
         None => (None, body.trim()),
     };
-    let Some(time) = parse_ampm(time_part) else { return Ok(None) };
+    // A wording change in Claude Code must show up as a note, not as blank reset times.
+    let unreadable = || format!("could not read Claude's reset time \"{}\"", util::shorten(text, 40));
+    let Some(time) = parse_ampm(time_part) else { return Err(unreadable()) };
     let now_local = Local.timestamp_opt(now, 0).single().ok_or("bad clock")?;
     let to_ts = |d: NaiveDate| Local.from_local_datetime(&d.and_time(time)).earliest().map(|t| t.timestamp());
     match date_part {
@@ -102,7 +107,7 @@ fn parse_claude_reset(text: &str, now: i64, local_tz: Option<&str>) -> Result<Op
             let month = parts.next().and_then(month_number);
             let day = parts.next().and_then(|s| s.parse::<u32>().ok());
             let year = parts.next().and_then(|s| s.parse::<i32>().ok());
-            let (Some(month), Some(day)) = (month, day) else { return Ok(None) };
+            let (Some(month), Some(day)) = (month, day) else { return Err(unreadable()) };
             let ts = match year {
                 Some(y) => NaiveDate::from_ymd_opt(y, month, day).and_then(to_ts),
                 None => {
@@ -125,6 +130,66 @@ fn parse_claude_reset(text: &str, now: i64, local_tz: Option<&str>) -> Result<Op
             })
         }
     }
+}
+
+/// Old and new spellings of the same zone. Claude Code runs on JavaScript, which prints
+/// the old name (Asia/Calcutta) while the system reports the new one (Asia/Kolkata).
+const ZONE_ALIASES: &[(&str, &str)] = &[
+    ("Asia/Calcutta", "Asia/Kolkata"),
+    ("Asia/Katmandu", "Asia/Kathmandu"),
+    ("Europe/Kiev", "Europe/Kyiv"),
+    ("Asia/Saigon", "Asia/Ho_Chi_Minh"),
+    ("Asia/Rangoon", "Asia/Yangon"),
+    ("Asia/Dacca", "Asia/Dhaka"),
+    ("Asia/Thimbu", "Asia/Thimphu"),
+    ("Asia/Ulan_Bator", "Asia/Ulaanbaatar"),
+    ("Atlantic/Faeroe", "Atlantic/Faroe"),
+    ("Europe/Uzhgorod", "Europe/Kyiv"),
+    ("Europe/Zaporozhye", "Europe/Kyiv"),
+    ("Pacific/Ponape", "Pacific/Pohnpei"),
+    ("Pacific/Truk", "Pacific/Chuuk"),
+    ("America/Buenos_Aires", "America/Argentina/Buenos_Aires"),
+    ("America/Catamarca", "America/Argentina/Catamarca"),
+    ("America/Cordoba", "America/Argentina/Cordoba"),
+    ("America/Jujuy", "America/Argentina/Jujuy"),
+    ("America/Mendoza", "America/Argentina/Mendoza"),
+    ("America/Indianapolis", "America/Indiana/Indianapolis"),
+    ("America/Louisville", "America/Kentucky/Louisville"),
+    ("America/Godthab", "America/Nuuk"),
+];
+
+const UTC_NAMES: &[&str] = &[
+    "UTC", "GMT", "UCT", "Universal", "Zulu", "Greenwich", "GMT0", "GMT+0", "GMT-0", "Etc/UTC", "Etc/GMT",
+    "Etc/UCT", "Etc/Universal", "Etc/Zulu", "Etc/Greenwich", "Etc/GMT0", "Etc/GMT+0", "Etc/GMT-0",
+];
+
+/// True when two zone names describe the same zone: equal, both UTC, a known alias pair,
+/// or two names whose tz database files hold the same bytes.
+fn same_zone(a: &str, b: &str) -> bool {
+    if a == b || (UTC_NAMES.contains(&a) && UTC_NAMES.contains(&b)) {
+        return true;
+    }
+    let canon = |z: &str| ZONE_ALIASES.iter().find(|(old, _)| *old == z).map(|x| x.1).unwrap_or(z).to_string();
+    if canon(a) == canon(b) {
+        return true;
+    }
+    match (zone_file(a), zone_file(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
+fn zone_file(name: &str) -> Option<Vec<u8>> {
+    let valid = !name.is_empty()
+        && !name.starts_with('/')
+        && name.split('/').all(|p| !p.is_empty() && p != "..")
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || "/_+-".contains(c));
+    if !valid {
+        return None;
+    }
+    let dir = std::env::var_os("TZDIR").map(std::path::PathBuf::from).unwrap_or_else(|| "/usr/share/zoneinfo".into());
+    let data = std::fs::read(dir.join(name)).ok()?;
+    data.starts_with(b"TZif").then_some(data)
 }
 
 fn parse_ampm(s: &str) -> Option<NaiveTime> {
@@ -156,7 +221,7 @@ fn month_number(s: &str) -> Option<u32> {
 
 /// Asks `codex app-server` for `account/rateLimits/read`: about 3 s.
 pub fn fetch_codex(bin: &Path) -> Result<Limits, String> {
-    let mut cmd = command(bin);
+    let mut cmd = command(bin)?;
     cmd.arg("app-server").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
     let mut child = cmd.spawn().map_err(|e| format!("could not start: {e}"))?;
     let pid = child.id();
@@ -175,6 +240,8 @@ pub fn fetch_codex(bin: &Path) -> Result<Limits, String> {
         let _ = child.kill();
         let _ = child.wait();
     }
+    // Anything the server started goes with it, so the reader thread reaches end of file.
+    util::kill_group(pid);
     util::unregister_child(pid);
     let fetched = util::now();
     parse_codex(&result?, fetched)
@@ -227,7 +294,7 @@ fn codex_exchange(child: &mut std::process::Child) -> Result<Value, String> {
 
 pub fn parse_codex(result: &Value, fetched_at: i64) -> Result<Limits, String> {
     let mut snapshots: Vec<&Value> = Vec::new();
-    if let Some(map) = result.get("rateLimitsByLimitId").and_then(Value::as_object) {
+    if let Some(map) = result.get("rateLimitsByLimitId").and_then(Value::as_object).filter(|m| !m.is_empty()) {
         // The main "codex" limit first, then any per-model limits.
         let mut keys: Vec<&String> = map.keys().collect();
         keys.sort_by_key(|k| (k.as_str() != "codex", k.to_string()));
@@ -253,8 +320,9 @@ pub fn parse_codex(result: &Value, fetched_at: i64) -> Result<Limits, String> {
                 label: mins.map(window_label).unwrap_or_else(|| key.to_string()),
                 used: w.get("usedPercent").and_then(Value::as_f64),
                 resets_at: w.get("resetsAt").and_then(Value::as_i64),
-                length: mins.map(|m| m * 60),
+                length: mins.map(|m| m.saturating_mul(60)),
                 not_started: false,
+                per_model: false,
             };
             mark_not_started(&mut win, fetched_at);
             windows.push(win);
@@ -313,9 +381,10 @@ fn capitalize(s: &str) -> String {
 
 /// `agy -p=/usage --output-format json`: 7 to 13 s.
 pub fn fetch_agy(bin: &Path) -> Result<Limits, String> {
-    // agy writes a log file per run; send it to one temp file and delete it afterwards.
-    let log = std::env::temp_dir().join(format!("quotatop-agy-{}.log", std::process::id()));
-    let mut cmd = command(bin);
+    // agy writes a log file per run, with the account email in it. Keep it in the private
+    // run folder and delete it afterwards; `util::clean_run_dir` removes any left by a kill.
+    let mut cmd = command(bin)?;
+    let log = util::run_dir()?.join(format!("agy-{}.log", std::process::id()));
     cmd.arg("-p=/usage").args(["--output-format", "json"]).arg("--log-file").arg(&log);
     let out = run_capture(cmd, Duration::from_secs(90));
     let _ = std::fs::remove_file(&log);
@@ -339,7 +408,7 @@ pub fn parse_agy(v: &Value, fetched_at: i64) -> Result<Limits, String> {
         .lines()
         .filter_map(|l| {
             let f: Vec<&str> = l.split('\t').collect();
-            let p = f.get(2)?.trim().strip_suffix('%')?.parse::<f64>().ok()?;
+            let p = f.get(2)?.trim().strip_suffix('%')?.parse::<f64>().ok().filter(|p| p.is_finite())?;
             Some((f[0].to_string(), f[1].to_string(), p))
         })
         .collect();
@@ -371,6 +440,7 @@ pub fn parse_agy(v: &Value, fetched_at: i64) -> Result<Limits, String> {
                 resets_at: b.get("reset_time").and_then(Value::as_str).and_then(util::parse_iso),
                 length,
                 not_started: false,
+                per_model: false,
             };
             mark_not_started(&mut w, fetched_at);
             windows.push(w);
@@ -444,6 +514,47 @@ mod tests {
     }
 
     #[test]
+    fn claude_zone_aliases_match() {
+        let now = local_ts(2026, 10, 18, 0, 10);
+        for (claude, system) in [
+            ("Asia/Calcutta", "Asia/Kolkata"),
+            ("Europe/Kiev", "Europe/Kyiv"),
+            ("UTC", "GMT"),
+            ("UTC", "Etc/UTC"),
+            ("America/Buenos_Aires", "America/Argentina/Buenos_Aires"),
+        ] {
+            let text = format!("Current session: 5% used · resets 3pm ({claude})");
+            let l = parse_claude_usage(&text, now, Some(system)).unwrap();
+            assert!(l.notes.is_empty(), "{claude} vs {system}: {:?}", l.notes);
+            assert!(l.pools[0].windows[0].resets_at.is_some());
+        }
+        assert!(!same_zone("Asia/Karachi", "Asia/Kolkata"));
+        assert!(!same_zone("../../etc/passwd", "../../etc/passwd/"));
+    }
+
+    #[test]
+    fn claude_unreadable_reset_is_noted() {
+        let l = parse_claude_usage("Current session: 5% used · resets in 3h\n", 0, None).unwrap();
+        assert_eq!(l.pools[0].windows[0].resets_at, None);
+        assert_eq!(l.notes.len(), 1);
+        assert!(parse_claude_usage("Current session: NaN% used\n", 0, None).is_err());
+    }
+
+    #[test]
+    fn claude_model_weeks_are_marked() {
+        let l = parse_claude_usage("Current week (all models): 5% used\nCurrent week (Opus): 50% used\n", 0, None).unwrap();
+        let w = &l.pools[0].windows;
+        assert!(!w[0].per_model && w[1].per_model);
+    }
+
+    #[test]
+    fn codex_empty_limit_map_falls_back() {
+        let v = json!({"rateLimitsByLimitId": {}, "rateLimits": {"primary": {"usedPercent": 12.0, "windowDurationMins": 300}}});
+        let l = parse_codex(&v, 0).unwrap();
+        assert_eq!(l.pools[0].windows[0].used, Some(12.0));
+    }
+
+    #[test]
     fn claude_unstarted_session() {
         let l = parse_claude_usage("Current session: 0% used\n", 0, None).unwrap();
         assert!(l.pools[0].windows[0].not_started);
@@ -486,7 +597,7 @@ mod tests {
         let v = json!({"status": "SUCCESS",
             "response": "Gemini Models\tFive Hour Limit Remaining\t87%\t2026-10-18T00:05:42Z\n",
             "command": {"data": {"groups": [{"name": "Gemini Models", "buckets": [
-                {"window": "5h", "name": "Five Hour Limit Remaining", "remaining_fraction": 0.8749,
+                {"window": "5h", "name": "Five Hour Limit Remaining", "remaining_fraction": 0.80,
                  "reset_time": "2026-10-18T00:05:42Z"}]}]}}});
         let l = parse_agy(&v, 0).unwrap();
         assert_eq!(l.pools[0].windows[0].used, Some(13.0));

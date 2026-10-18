@@ -11,6 +11,8 @@ pub struct Window {
     pub length: Option<i64>,
     /// The window has not begun: nothing used, and the reset time is "now + length".
     pub not_started: bool,
+    /// A limit for one model only, such as Claude's "Weekly Opus". "Most room now" skips it.
+    pub per_model: bool,
 }
 
 /// A group of windows that share one quota. Antigravity has two.
@@ -40,6 +42,17 @@ pub struct Reading {
     pub error: Option<String>,
     /// The CLI is not installed.
     pub missing: bool,
+    /// Seconds between refreshes in use now (longer with --idle-backoff), for the stale threshold.
+    pub interval: u64,
+    /// When the next fetch is planned.
+    pub next_at: Option<i64>,
+}
+
+impl Reading {
+    /// A reading older than two refresh intervals, and at least 2 minutes, is stale.
+    pub fn stale_after(&self) -> i64 {
+        i64::try_from(self.interval.saturating_mul(2)).unwrap_or(i64::MAX).max(120)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -127,6 +140,8 @@ pub struct State {
     pub sessions: Vec<Session>,
     pub sessions_at: Option<i64>,
     pub sessions_error: Option<String>,
+    /// Recent Codex sessions left off the list.
+    pub codex_hidden: usize,
     /// Newest activity across all local sessions, for --idle-backoff.
     pub last_local_activity: Option<i64>,
 }

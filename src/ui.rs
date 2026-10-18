@@ -11,17 +11,6 @@ use ratatui::widgets::{Block, BorderType, Paragraph};
 use crate::model::{Activity, Cache, Provider, Reading, Session, State, Tool, Window};
 use crate::util::{self, tokens};
 
-pub struct UiState {
-    /// Seconds between limit refreshes, for the "trying again" note and the stale threshold.
-    pub interval: u64,
-}
-
-impl UiState {
-    pub fn stale_after(&self) -> i64 {
-        (self.interval as i64 * 2).max(120)
-    }
-}
-
 pub struct Section {
     pub title: Line<'static>,
     pub status: Line<'static>,
@@ -170,7 +159,7 @@ fn context_bar(ctx: u64, window: u64, compact: Option<u64>, cells: usize, style:
 
 // ------------------------------------------------------------ screen
 
-pub fn build(s: &State, ui: &UiState, now_ms: i64, cols: u16) -> Screen {
+pub fn build(s: &State, now_ms: i64, cols: u16) -> Screen {
     let now = now_ms / 1000;
     let inner = (cols as usize).saturating_sub(2);
     let mut redraw_ms: u64 = 5_000;
@@ -182,7 +171,7 @@ pub fn build(s: &State, ui: &UiState, now_ms: i64, cols: u16) -> Screen {
     let gap = (cols as usize).saturating_sub(width(left) + width(&right)).max(1);
     let header = vec![
         Line::from(vec![Span::styled(left, bold().patch(fg(TITLE))), Span::raw(" ".repeat(gap)), Span::styled(right, dim())]),
-        most_room(s, now, ui.stale_after(), cols as usize),
+        most_room(s, now, cols as usize),
     ];
 
     let mut limits = Vec::new();
@@ -191,7 +180,7 @@ pub fn build(s: &State, ui: &UiState, now_ms: i64, cols: u16) -> Screen {
         if r.loading || (r.data.is_none() && r.error.is_none() && !r.missing) {
             fast(250);
         }
-        limits.push(limit_section(p, r, ui, now, now_ms, inner, &mut fast));
+        limits.push(limit_section(p, r, now, now_ms, inner, &mut fast));
     }
 
     let sessions = sessions_section(s, now, inner, &mut fast);
@@ -199,18 +188,21 @@ pub fn build(s: &State, ui: &UiState, now_ms: i64, cols: u16) -> Screen {
     Screen { header, limits, sessions, legend, redraw_ms }
 }
 
-fn limit_section(p: Provider, r: &Reading, ui: &UiState, now: i64, now_ms: i64, inner: usize, fast: &mut impl FnMut(u64)) -> Section {
+fn limit_section(p: Provider, r: &Reading, now: i64, now_ms: i64, inner: usize, fast: &mut impl FnMut(u64)) -> Section {
     let mut title = format!(" {} ", p.title());
     if let Some(plan) = r.data.as_ref().and_then(|d| d.plan.as_ref()) {
         title = format!(" {} · {plan} ", p.title());
     }
     let spin = spinner(now_ms);
     let age = r.fetched_at.map(|t| now - t);
-    let stale = age.is_some_and(|a| a > ui.stale_after());
+    let stale = age.is_some_and(|a| a > r.stale_after());
+    // Before the first fetch: the CLIs start 20 s apart.
+    let waiting = r.next_at.filter(|t| !r.loading && *t > now);
     let status = if r.missing {
         Line::styled(" not installed ", dim())
     } else {
         match (&r.data, &r.error) {
+            (None, None) if waiting.is_some() => Line::styled(" waiting ", dim()),
             (None, None) => Line::styled(format!(" {spin} loading "), fg(YELLOW)),
             (None, Some(_)) if r.loading => Line::styled(format!(" {spin} trying again "), fg(YELLOW)),
             (None, Some(_)) => Line::styled(" ✗ no reading ", fg(RED)),
@@ -264,7 +256,14 @@ fn limit_section(p: Provider, r: &Reading, ui: &UiState, now: i64, now_ms: i64, 
         }
     } else if let Some(e) = &r.error {
         body.push(Line::styled(format!(" ✗ could not read limits: {}", util::shorten(e, inner.saturating_sub(29))), fg(RED)));
-        body.push(Line::styled(format!(" trying again every {} s", ui.interval), dim()));
+        let next = match r.next_at {
+            _ if r.loading => format!(" {spin} trying again"),
+            Some(t) if t > now => format!(" next try at {} (in {})", util::clock(t), util::duration(t - now)),
+            _ => " trying again shortly".to_string(),
+        };
+        body.push(Line::styled(next, dim()));
+    } else if let Some(t) = waiting {
+        body.push(Line::styled(format!(" first reading in {}; the CLIs start 20 s apart", util::duration(t - now)), dim()));
     } else {
         let secs = match p {
             Provider::Claude => "about 4 s",
@@ -327,17 +326,22 @@ fn window_row(w: &Window, label_w: usize, now: i64, inner: usize, fast: &mut imp
     Line::from(spans)
 }
 
-fn most_room(s: &State, now: i64, stale_after: i64, cols: usize) -> Line<'static> {
+fn most_room(s: &State, now: i64, cols: usize) -> Line<'static> {
     let mut items: Vec<(String, f64)> = Vec::new();
     for p in Provider::ALL {
         let r = s.reading(p);
         let Some(d) = &r.data else { continue };
-        if r.fetched_at.is_none_or(|t| now - t > stale_after) {
+        if r.fetched_at.is_none_or(|t| now - t > r.stale_after()) {
             continue;
         }
         for pool in &d.pools {
-            let used: Option<Vec<f64>> =
-                pool.windows.iter().map(|w| if w.not_started { Some(0.0) } else { w.used }).collect();
+            // A per-model limit such as "Weekly Opus" only binds that model, not the pool.
+            let used: Option<Vec<f64>> = pool
+                .windows
+                .iter()
+                .filter(|w| !w.per_model)
+                .map(|w| if w.not_started { Some(0.0) } else { w.used })
+                .collect();
             if let Some(m) = used.and_then(|u| u.into_iter().reduce(f64::max)) {
                 items.push((pool.short.clone(), m));
             }
@@ -354,7 +358,12 @@ fn most_room(s: &State, now: i64, stale_after: i64, cols: usize) -> Line<'static
         let l = level(*p);
         let text = format!("{} {name} {}", level_sym(l), util::pct(*p));
         let sep = if i == 0 { 0 } else { 3 };
-        if used_w + sep + width(&text) > cols {
+        let left = items.len() - i - 1;
+        // Keep room for "· +N more" unless this is the last item.
+        let more_w = if left > 0 { 3 + width(&format!("+{left} more")) } else { 0 };
+        if used_w + sep + width(&text) + more_w > cols {
+            let more = items.len() - i;
+            spans.push(Span::styled(if i == 0 { format!("+{more} more") } else { format!(" · +{more} more") }, dim()));
             break;
         }
         if i > 0 {
@@ -377,6 +386,10 @@ fn sessions_section(s: &State, now: i64, inner: usize, fast: &mut impl FnMut(u64
             Some(_) => " No running Claude sessions, and no Codex activity in the last 6 h.".to_string(),
         };
         body.push(Line::styled(msg, dim()));
+    }
+    if s.codex_hidden > 0 {
+        let n = s.codex_hidden;
+        body.push(Line::styled(format!(" +{n} more Codex session{} active in the last 6 h", if n == 1 { "" } else { "s" }), dim()));
     }
     if let Some(e) = &s.sessions_error {
         body.push(Line::styled(format!(" ⚠ {e}"), fg(YELLOW)));
@@ -457,25 +470,46 @@ fn session_lines(s: &Session, now: i64, inner: usize, fast: &mut impl FnMut(u64)
         Cache::Known { ttl, expires_at, cached, recache, recache_at_least, exact } => {
             let approx = if *exact { "" } else { "≈" };
             let left = expires_at - now;
-            let re = recache.map(|r| format!("{}{}", if *recache_at_least { "at least " } else { "" }, tokens(r)));
+            // Long and short forms of the re-cache figure.
+            let re = recache.map(|r| {
+                let t = tokens(r);
+                match (*recache_at_least, *exact) {
+                    (true, _) => (format!("at least {t}"), format!("≥{t}")),
+                    (false, false) => (format!("≈{t}"), format!("≈{t}")),
+                    (false, true) => (t.clone(), t),
+                }
+            });
+            // Longest wording first; the first one that fits the row wins, so a narrow
+            // terminal drops whole phrases instead of cutting one in half.
+            let mut options: Vec<Vec<Span<'static>>> = Vec::new();
             if left > 0 {
                 if left < 600 {
                     fast(1_000);
                 }
-                let urgent = left < 300 || (*ttl > 0 && left * 5 < *ttl);
+                let urgent = left < 300 || (*ttl > 0 && left.saturating_mul(5) < *ttl);
                 let style = if urgent { fg(YELLOW) } else { fg(GREEN) };
-                cache.push(Span::styled(format!("● warm, {approx}{} left", util::duration(left)), style));
-                cache.push(Span::raw(format!("   {} cached", tokens(*cached))));
-                if let Some(re) = re {
-                    cache.push(Span::styled(format!("   if it goes cold: {re}"), dim()));
+                let state = Span::styled(format!("● warm, {approx}{} left", util::duration(left)), style);
+                let size = Span::raw(format!("   {} cached", tokens(*cached)));
+                if let Some((long, short)) = &re {
+                    options.push(vec![state.clone(), size.clone(), Span::styled(format!("   if it goes cold: {long}"), dim())]);
+                    options.push(vec![state.clone(), size.clone(), Span::styled(format!("   cold: {short}"), dim())]);
                 }
+                options.push(vec![state.clone(), size]);
+                options.push(vec![state]);
             } else {
                 let since = if now - expires_at < 86_400 { util::clock(*expires_at) } else { util::date(*expires_at) };
-                cache.push(Span::styled(format!("○ cold since {approx}{since}"), fg(COLD)));
-                if let Some(re) = re {
-                    cache.push(Span::raw(format!("   next message re-caches {re}")));
+                let state = Span::styled(format!("○ cold since {approx}{since}"), fg(COLD));
+                if let Some((long, short)) = &re {
+                    options.push(vec![state.clone(), Span::raw(format!("   next message re-caches {long}"))]);
+                    options.push(vec![state.clone(), Span::raw(format!("   re-caches {short}"))]);
                 }
+                options.push(vec![state]);
             }
+            let room = inner.saturating_sub(11);
+            let fits = |o: &Vec<Span<'static>>| o.iter().map(|s| s.width()).sum::<usize>() <= room;
+            let n = options.len();
+            let pick = options.iter().position(fits).unwrap_or(n - 1);
+            cache.extend(options.swap_remove(pick));
         }
     }
     vec![first, Line::from(ctx), Line::from(cache)]
