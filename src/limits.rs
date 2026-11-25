@@ -69,6 +69,10 @@ pub fn parse_claude_usage(text: &str, now: i64, local_tz: Option<&str>) -> Resul
         });
     }
     if windows.is_empty() {
+        // Signed out, `claude -p /usage` prints only the local cost summary.
+        if text.trim_start().starts_with("Total cost:") {
+            return Err("Claude Code is signed out: run `claude auth login`".into());
+        }
         let first = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("empty output");
         return Err(format!("could not read /usage: {}", util::shorten(first, 70)));
     }
@@ -558,6 +562,13 @@ mod tests {
     fn claude_unstarted_session() {
         let l = parse_claude_usage("Current session: 0% used\n", 0, None).unwrap();
         assert!(l.pools[0].windows[0].not_started);
+    }
+
+    #[test]
+    fn claude_signed_out_says_so() {
+        let text = "Total cost:            $0.0000\nTotal duration (API):  0s\n";
+        let e = parse_claude_usage(text, 0, None).unwrap_err();
+        assert!(e.contains("signed out"), "{e}");
     }
 
     #[test]
