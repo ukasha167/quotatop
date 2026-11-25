@@ -1,8 +1,17 @@
 # quotatop
 
+![Rust](https://img.shields.io/badge/Rust-2024_edition-000000?logo=rust&logoColor=white)
+![ratatui](https://img.shields.io/badge/ratatui-0.30-4B32C3)
+![Binary](https://img.shields.io/badge/binary-1.1_MB-555555)
+![Memory](https://img.shields.io/badge/memory-8_to_23_MB-555555)
+![Tests](https://img.shields.io/badge/tests-45-2EA043)
+![Platforms](https://img.shields.io/badge/macOS_·_Linux_·_Windows-555555)
+
 A terminal dashboard for three AI coding subscriptions at once: Claude (Claude Code), ChatGPT (Codex) and Google (Antigravity, `agy`). It shows each subscription's 5-hour and weekly limits, every running session's context use and auto-compact point, and each Claude session's prompt cache state.
 
 It spends no tokens and makes no paid API calls. It never reads stored credentials (Keychain, OAuth tokens, cookies, `auth.json`). Each number comes from a CLI's own `/usage` or from the logs the CLIs write locally.
+
+<img src="docs/screenshot.png" width="720" alt="quotatop in a macOS terminal: Claude at 82% of its 5-hour limit and 3% of its weekly limit, two Antigravity model groups at 0%, and one working Claude session using 191k of a 1M context with a warm cache">
 
 ```
  AI subscriptions                           Sun 18 Oct 00:42  r refresh  q quit
